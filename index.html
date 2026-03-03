@@ -574,7 +574,28 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
 <script type="text/babel">
-const { useState, useEffect, useCallback, memo } = React;
+const { useState, useEffect, useCallback, memo, useRef } = React;
+
+// ══════════════════════════════════════
+// API HELPER - Conexão com Backend
+// ══════════════════════════════════════
+const API_URL = '/api';
+let authToken = null;
+
+const api = async (path, options = {}) => {
+  const headers = { 'Content-Type': 'application/json' };
+  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  try {
+    const res = await fetch(`${API_URL}${path}`, { ...options, headers });
+    if (res.status === 401) { authToken = null; return null; }
+    return await res.json();
+  } catch (e) { console.error('API Error:', e); return null; }
+};
+
+const apiGet = (path) => api(path);
+const apiPost = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body) });
+const apiPut = (path, body) => api(path, { method: 'PUT', body: JSON.stringify(body) });
+const apiDel = (path) => api(path, { method: 'DELETE' });
 
 const menuInicial = {
   Pratos: [
@@ -661,14 +682,20 @@ function App() {
     setLoginPin(newPin);
     setLoginError("");
     if(newPin.length === 4) {
-      if(loginStaff && loginStaff.pin === newPin) {
-        setUser(loginStaff);
-        setLoginPin("");
-        setLoginStaff(null);
-      } else {
-        setLoginError("PIN incorreto!");
-        setTimeout(() => { setLoginPin(""); setLoginError(""); }, 1000);
-      }
+      // API Login
+      apiPost('/auth/login', { pin: newPin }).then(data => {
+        if(data && data.token) {
+          authToken = data.token;
+          setUser(data.user);
+          setLoginPin("");
+          setLoginStaff(null);
+          // Carregar dados do banco
+          loadFromAPI(data.user);
+        } else {
+          setLoginError("PIN incorreto!");
+          setTimeout(() => { setLoginPin(""); setLoginError(""); }, 1000);
+        }
+      });
     }
   };
   const handlePinDelete = () => { setLoginPin(p=>p.slice(0,-1)); setLoginError(""); };
@@ -733,6 +760,84 @@ function App() {
   const [pixNome,setPixNome] = useState("Restaurante Sabor & Arte");
   const [pixCidade,setPixCidade] = useState("São Paulo");
 
+  // ── LOAD DATA FROM API ──
+  const loadFromAPI = async (loggedUser) => {
+    // Cardápio
+    const cardapioData = await apiGet('/cardapio');
+    if (cardapioData) {
+      const grouped = { Pratos: [], Bebidas: [], Petiscos: [] };
+      cardapioData.forEach(item => {
+        const cat = item.categoria || 'Pratos';
+        if (!grouped[cat]) grouped[cat] = [];
+        grouped[cat].push({ id: item.id, name: item.nome, price: parseFloat(item.preco), img: item.emoji, foto: item.foto });
+      });
+      setMenuData(grouped);
+    }
+
+    // Mesas
+    const mesasData = await apiGet('/mesas');
+    if (mesasData) {
+      const m = {};
+      mesasData.forEach(mesa => {
+        m[mesa.numero] = {
+          status: mesa.conta_id ? 'ocupada' : mesa.status,
+          garcom: mesa.garcom_nome || '',
+          cliente: mesa.cliente || '',
+          pedidos: [],
+          abertoEm: mesa.aberta_em ? new Date(mesa.aberta_em).toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'}) : null,
+          enviadoCozinha: [],
+          conta_id: mesa.conta_id || null,
+        };
+        // Carregar pedidos da conta aberta
+        if (mesa.conta_id) {
+          apiGet(`/contas/${mesa.conta_id}/pedidos`).then(peds => {
+            if (peds && peds.length) {
+              setMesas(prev => ({
+                ...prev,
+                [mesa.numero]: {
+                  ...prev[mesa.numero],
+                  pedidos: peds.map(p => ({
+                    id: p.cardapio_id, name: p.nome_item, price: parseFloat(p.preco_unit),
+                    qty: p.quantidade, hora: p.hora, pedido_id: p.id
+                  }))
+                }
+              }));
+            }
+          });
+        }
+      });
+      setMesas(m);
+    }
+
+    // Reservas
+    const reservasData = await apiGet('/reservas');
+    if (reservasData) {
+      setReservas(reservasData.map(r => ({
+        id: r.id, nome: r.nome, mesa: r.mesa_numero, hora: r.hora,
+        pessoas: r.pessoas, tel: r.telefone || '', obs: r.observacoes || '',
+        confirmada: r.confirmada, mesa_id: r.mesa_id
+      })));
+    }
+
+    // Histórico
+    const relData = await apiGet('/relatorios/hoje');
+    if (relData && relData.vendas) {
+      setHist(relData.vendas.map(v => ({
+        id: v.codigo, hora: v.hora, mesa: v.mesa_numero, total: parseFloat(v.total),
+        pag: v.forma_pagamento, cliente: v.cliente_nome, garcom: v.garcom_nome,
+        itens: typeof v.itens === 'string' ? JSON.parse(v.itens) : v.itens
+      })));
+    }
+
+    // Config PIX
+    const cfgData = await apiGet('/config');
+    if (cfgData) {
+      if (cfgData.pix_key) setPixKey(cfgData.pix_key);
+      if (cfgData.pix_nome) setPixNome(cfgData.pix_nome);
+      if (cfgData.pix_cidade) setPixCidade(cfgData.pix_cidade);
+    }
+  };
+
   // ── DERIVED STATE ──
   const mesa = mesas[mesaAtual];
   const ped = mesa.pedidos;
@@ -785,20 +890,27 @@ function App() {
   const notify = useCallback((msg)=>{setNotif(msg);setTimeout(()=>setNotif(null),2500);},[]);
   const upMesa = useCallback((id,ch)=>setMesas(p=>({...p,[id]:{...p[id],...ch}})),[]);
 
-  const abrirMesa=()=>{
+  const abrirMesa=async()=>{
     if(!fCliente.trim())return;
-    upMesa(mesaAtual,{status:"ocupada",garcom:fGarcom,cliente:fCliente.trim(),pedidos:[],abertoEm:now(),enviadoCozinha:[]});
+    const garcomObj = staff.find(s => s.nome === fGarcom);
+    const result = await apiPost(`/mesas/${mesaAtual}/abrir`, { cliente: fCliente.trim(), garcom_id: garcomObj?.id || 2 });
+    upMesa(mesaAtual,{status:"ocupada",garcom:fGarcom,cliente:fCliente.trim(),pedidos:[],abertoEm:now(),enviadoCozinha:[],conta_id:result?.id||null});
     notify(`✅ Mesa ${mesaAtual} aberta para ${fCliente.trim()}`);
     setFCliente("");setModal(null);
   };
 
   const addItem=(item)=>{
-    if(!aberta){setFCliente("");setFGarcom("João");setModal("abrir");return;}
+    if(!aberta){setFCliente("");setFGarcom(isGarcom?user.nome:"João");setModal("abrir");return;}
+    // Update local state immediately (optimistic)
     setMesas(p=>{const m={...p[mesaAtual]};const e=m.pedidos.find(x=>x.id===item.id);
       if(e)m.pedidos=m.pedidos.map(x=>x.id===item.id?{...x,qty:x.qty+1}:x);
       else m.pedidos=[...m.pedidos,{...item,qty:1,hora:now()}];
       return{...p,[mesaAtual]:m};
     });
+    // Sync with API
+    if(mesa.conta_id) {
+      apiPost(`/contas/${mesa.conta_id}/pedidos`, { cardapio_id: item.id, nome_item: item.name, preco_unit: item.price, quantidade: 1 });
+    }
   };
 
   const inc=()=>{
@@ -822,6 +934,7 @@ function App() {
   const del=()=>{
     if(sel===null){notify("⚠️ Selecione um item primeiro");return;}
     const it=ped.find(p=>p.id===sel);
+    if(it && it.pedido_id) apiDel(`/pedidos/${it.pedido_id}`);
     setMesas(p=>{const m={...p[mesaAtual]};m.pedidos=m.pedidos.filter(x=>x.id!==sel);return{...p,[mesaAtual]:m};});
     setSel(null);if(it)notify(`🗑️ ${it.name} removido`);
   };
@@ -830,36 +943,51 @@ function App() {
     if(!ped.length){notify("⚠️ Nenhum item");return;}
     const r=`${now()} — ${ped.map(p=>`${p.name} ×${p.qty}`).join(", ")}`;
     upMesa(mesaAtual,{enviadoCozinha:[...mesa.enviadoCozinha,r]});
+    if(mesa.conta_id) apiPost(`/contas/${mesa.conta_id}/cozinha`, { descricao: r });
     notify("👨‍🍳 Pedido enviado para a cozinha!");setModal(null);
   };
 
-  const fechar=()=>{
+  const fechar=async()=>{
     if(!pag){notify("⚠️ Selecione pagamento!");return;}
-    setHist(p=>[{id:`#${1046+p.length}`,hora:now(),mesa:mesaAtual,total:tot,pag,cliente:mesa.cliente,garcom:mesa.garcom,
-      itens:ped.map(p=>({name:p.name,qty:p.qty,price:p.price}))},...p]);
-    upMesa(mesaAtual,{status:"livre",garcom:"",cliente:"",pedidos:[],abertoEm:null,enviadoCozinha:[]});
+    // API call to close
+    if(mesa.conta_id) {
+      const result = await apiPost(`/contas/${mesa.conta_id}/fechar`, { forma_pagamento: pag });
+      if(result) {
+        setHist(p=>[{id:result.codigo||`#${1046+p.length}`,hora:now(),mesa:mesaAtual,total:tot,pag,cliente:mesa.cliente,garcom:mesa.garcom,
+          itens:ped.map(p=>({name:p.name,qty:p.qty,price:p.price}))},...p]);
+      }
+    } else {
+      setHist(p=>[{id:`#${1046+p.length}`,hora:now(),mesa:mesaAtual,total:tot,pag,cliente:mesa.cliente,garcom:mesa.garcom,
+        itens:ped.map(p=>({name:p.name,qty:p.qty,price:p.price}))},...p]);
+    }
+    upMesa(mesaAtual,{status:"livre",garcom:"",cliente:"",pedidos:[],abertoEm:null,enviadoCozinha:[],conta_id:null});
     notify(`✅ Mesa ${mesaAtual} fechada! ${fmt(tot)} — ${pag}`);
     setPag(null);setSel(null);setModal(null);
   };
 
-  const criarItem=()=>{
+  const criarItem=async()=>{
     if(!fNome.trim()||!fPreco)return;
     const pr=parseFloat(fPreco.replace(",","."));
     if(isNaN(pr)||pr<=0){notify("⚠️ Preço inválido");return;}
-    setMenuData(p=>({...p,[tab]:[...p[tab],{id:nextId,name:fNome.trim(),price:pr,img:fEmoji||"🍽️",foto:fFoto||""}]}));
+    const catMap = { Pratos: 1, Bebidas: 2, Petiscos: 3 };
+    const result = await apiPost('/cardapio', { nome: fNome.trim(), preco: pr, categoria_id: catMap[tab] || 1, emoji: fEmoji || "🍽️", foto: fFoto || null });
+    const newId = result?.id || nextId;
+    setMenuData(p=>({...p,[tab]:[...p[tab],{id:newId,name:fNome.trim(),price:pr,img:fEmoji||"🍽️",foto:fFoto||""}]}));
     setNextId(p=>p+1);notify(`✅ "${fNome.trim()}" adicionado!`);
-    setFNome("");setFPreco("");setFEmoji("");setModal(null);
+    setFNome("");setFPreco("");setFEmoji("");setFFoto("");setModal(null);
   };
 
-  const editItem=()=>{
+  const editItem=async()=>{
     if(!fEdit||!fNome.trim()||!fPreco)return;
     const pr=parseFloat(fPreco.replace(",","."));
     if(isNaN(pr)||pr<=0){notify("⚠️ Preço inválido");return;}
+    await apiPut(`/cardapio/${fEdit.id}`, { nome: fNome.trim(), preco: pr, emoji: fEmoji || fEdit.img, foto: fFoto || null });
     setMenuData(p=>({...p,[tab]:p[tab].map(i=>i.id===fEdit.id?{...i,name:fNome.trim(),price:pr,img:fEmoji||i.img,foto:fFoto||""}:i)}));
     notify(`✅ "${fNome.trim()}" atualizado!`);setModal(null);
   };
 
   const delItem=(id)=>{
+    apiDel(`/cardapio/${id}`);
     setMenuData(p=>({...p,[tab]:p[tab].filter(i=>i.id!==id)}));
     notify("🗑️ Item removido");setModal(null);
   };
@@ -896,13 +1024,17 @@ function App() {
   );
 
   // Reserva helpers
-  const addReserva = () => {
+  const addReserva = async () => {
     if(!rNome.trim()||!rMesa||!rHora) { notify("⚠️ Preencha nome, mesa e horário"); return; }
-    setReservas(p=>[...p,{id:Date.now(),nome:rNome.trim(),mesa:+rMesa,hora:rHora,pessoas:+rPessoas||2,tel:rTel,obs:rObs,confirmada:false}]);
+    const mesaObj = Object.entries(mesas).find(([num]) => +num === +rMesa);
+    const mesaId = +rMesa;
+    const result = await apiPost('/reservas', { nome: rNome.trim(), mesa_id: mesaId, hora: rHora, pessoas: +rPessoas || 2, telefone: rTel, observacoes: rObs });
+    setReservas(p=>[...p,{id:result?.id||Date.now(),nome:rNome.trim(),mesa:+rMesa,hora:rHora,pessoas:+rPessoas||2,tel:rTel,obs:rObs,confirmada:false}]);
+    upMesa(+rMesa, {status:"reservada"});
     notify(`✅ Reserva de ${rNome.trim()} cadastrada!`);
     setRNome("");setRMesa("");setRHora("");setRPessoas("2");setRTel("");setRObs("");
   };
-  const delReserva = (id) => { setReservas(p=>p.filter(r=>r.id!==id)); notify("🗑️ Reserva removida"); };
+  const delReserva = (id) => { apiDel(`/reservas/${id}`); setReservas(p=>p.filter(r=>r.id!==id)); notify("🗑️ Reserva removida"); };
 
   const Timer = memo(()=>{
     const [el,setEl]=useState("");
@@ -987,7 +1119,7 @@ function App() {
           <div className="header-icons">
             {isGerente && ["🔔","✉️"].map((ic,i)=><div key={i} className="header-icon">{ic}</div>)}
             {isGerente && <div className="header-icon" onClick={()=>setModal("config")}>⚙️</div>}
-            <div className="header-icon" onClick={()=>{setUser(null);setMesaAtual(1);setSel(null);setPag(null);}} title="Sair" style={{background:"rgba(239,68,68,0.15)",borderColor:"rgba(239,68,68,0.3)"}}>🚪</div>
+            <div className="header-icon" onClick={()=>{authToken=null;setUser(null);setMesaAtual(1);setSel(null);setPag(null);}} title="Sair" style={{background:"rgba(239,68,68,0.15)",borderColor:"rgba(239,68,68,0.3)"}}>🚪</div>
           </div>
         </div>
       </div>
@@ -1165,7 +1297,7 @@ function App() {
           <button className="footer-btn" onClick={()=>{setSel(null);setPag(null);}}>⏪ Voltar</button>
           {isGerente && <button className="footer-btn" onClick={()=>setModal("config")}>⚙️ Config</button>}
           {isGerente && <button className="footer-btn" onClick={()=>setModal("gerenciarStaff")}>👥 Equipe</button>}
-          <button className="footer-btn" onClick={()=>{setUser(null);}} style={{borderColor:"rgba(239,68,68,0.3)",color:"#fca5a5"}}>🚪 Sair</button>
+          <button className="footer-btn" onClick={()=>{authToken=null;setUser(null);}} style={{borderColor:"rgba(239,68,68,0.3)",color:"#fca5a5"}}>🚪 Sair</button>
         </div>
       </div>
 
@@ -1451,7 +1583,7 @@ function App() {
                   </div>
                   <div className="reserva-actions">
                     {!r.confirmada&&(
-                      <button className="reserva-action-btn confirm" onClick={()=>setReservas(p=>p.map(x=>x.id===r.id?{...x,confirmada:true}:x))}>
+                      <button className="reserva-action-btn confirm" onClick={()=>{apiPut(`/reservas/${r.id}/confirmar`,{});setReservas(p=>p.map(x=>x.id===r.id?{...x,confirmada:true}:x))}}>
                         ✓ Confirmar
                       </button>
                     )}
@@ -2028,7 +2160,10 @@ function App() {
                 )}
                 <div style={{fontSize:11,color:"#888",marginTop:6,wordBreak:"break-all"}}>{pixKey}</div>
               </div>
-              <div className="modal-btns"><button className="modal-btn secondary" onClick={()=>setModal(null)}>Fechar</button></div>
+              <div className="modal-btns">
+                <button className="modal-btn blue" onClick={()=>{apiPut('/config',{pix_key:pixKey,pix_nome:pixNome,pix_cidade:pixCidade,taxa_servico:taxaSrv?"10":"0"});notify("✅ Configurações salvas!");setModal(null);}}>💾 Salvar</button>
+                <button className="modal-btn secondary" onClick={()=>setModal(null)}>Fechar</button>
+              </div>
             </>}
 
           </div>
