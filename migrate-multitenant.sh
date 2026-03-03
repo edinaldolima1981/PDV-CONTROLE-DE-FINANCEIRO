@@ -1,3 +1,58 @@
+#!/bin/bash
+echo "=========================================="
+echo "  MIGRAÇÃO: Multi-Empresa (SaaS)"
+echo "=========================================="
+
+cd /var/www/PDV-CONTROLE-DE-FINANCEIRO
+
+# 1. Rodar migração no PostgreSQL
+echo "[1/3] Rodando migração no banco..."
+docker exec -i pdv_postgres psql -U pdv_admin -d pdv_restaurante << 'SQLEOF'
+CREATE TABLE IF NOT EXISTS empresas (
+    id SERIAL PRIMARY KEY,
+    nome VARCHAR(150) NOT NULL,
+    slug VARCHAR(50) UNIQUE,
+    senha VARCHAR(255) NOT NULL,
+    logo VARCHAR(10) DEFAULT '🍽️',
+    cor_tema VARCHAR(7) DEFAULT '#f97316',
+    telefone VARCHAR(30),
+    endereco TEXT,
+    ativo BOOLEAN DEFAULT true,
+    criado_em TIMESTAMP DEFAULT NOW()
+);
+ALTER TABLE staff ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+ALTER TABLE categorias ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+ALTER TABLE cardapio ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+ALTER TABLE mesas ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+ALTER TABLE contas ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+ALTER TABLE reservas ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+ALTER TABLE clientes ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+ALTER TABLE historico_vendas ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+ALTER TABLE config ADD COLUMN IF NOT EXISTS empresa_id INT REFERENCES empresas(id);
+CREATE INDEX IF NOT EXISTS idx_staff_empresa ON staff(empresa_id);
+CREATE INDEX IF NOT EXISTS idx_cardapio_empresa ON cardapio(empresa_id);
+CREATE INDEX IF NOT EXISTS idx_mesas_empresa ON mesas(empresa_id);
+CREATE INDEX IF NOT EXISTS idx_contas_empresa ON contas(empresa_id);
+CREATE INDEX IF NOT EXISTS idx_historico_empresa ON historico_vendas(empresa_id);
+CREATE INDEX IF NOT EXISTS idx_config_empresa ON config(empresa_id);
+ALTER TABLE config DROP CONSTRAINT IF EXISTS config_chave_key;
+DO $$ BEGIN ALTER TABLE config ADD CONSTRAINT config_chave_empresa_unique UNIQUE(chave, empresa_id); EXCEPTION WHEN duplicate_table THEN NULL; END $$;
+INSERT INTO empresas (nome, slug, senha, logo, cor_tema) VALUES ('Restaurante Demo', 'demo', '$2b$10$8K1p/a0dL1LXMIgoEDFrwOeyuN.SJ8MQsSoMXTnMLLQ6K6V5JGxK.', '🍺', '#f97316') ON CONFLICT (slug) DO NOTHING;
+UPDATE staff SET empresa_id = 1 WHERE empresa_id IS NULL;
+UPDATE categorias SET empresa_id = 1 WHERE empresa_id IS NULL;
+UPDATE cardapio SET empresa_id = 1 WHERE empresa_id IS NULL;
+UPDATE mesas SET empresa_id = 1 WHERE empresa_id IS NULL;
+UPDATE contas SET empresa_id = 1 WHERE empresa_id IS NULL;
+UPDATE reservas SET empresa_id = 1 WHERE empresa_id IS NULL;
+UPDATE clientes SET empresa_id = 1 WHERE empresa_id IS NULL;
+UPDATE historico_vendas SET empresa_id = 1 WHERE empresa_id IS NULL;
+UPDATE config SET empresa_id = 1 WHERE empresa_id IS NULL;
+SQLEOF
+echo "[OK] Migração concluída"
+
+# 2. Atualizar server.js
+echo "[2/3] Atualizando API..."
+cat > backend/src/server.js << 'SRVEOF'
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
@@ -73,7 +128,6 @@ app.post('/api/clientes', auth, async(req,res)=>{ try{const{nome,telefone,email,
 
 app.get('/api/cozinha', auth, async(req,res)=>{ try{const r=await query("SELECT p.*,c.cliente,m.numero as mesa_numero,s.nome as garcom_nome FROM pedidos p JOIN contas c ON p.conta_id=c.id JOIN mesas m ON c.mesa_id=m.id JOIN staff s ON c.garcom_id=s.id WHERE c.status='aberta' AND c.empresa_id=$1 AND p.status IN('pendente','preparando') ORDER BY p.criado_em",[req.empresa_id]);res.json(r.rows);}catch(e){res.status(500).json({error:e.message});} });
 app.put('/api/cozinha/:id/pronto', auth, async(req,res)=>{ try{await query("UPDATE pedidos SET status='pronto' WHERE id=$1",[req.params.id]);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});} });
-app.put('/api/cozinha/:id/status', auth, async(req,res)=>{ try{const{status}=req.body;await query('UPDATE pedidos SET status=$1 WHERE id=$2',[status,req.params.id]);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});} });
 
 app.get('/api/config', auth, async(req,res)=>{ try{const r=await query('SELECT chave,valor FROM config WHERE empresa_id=$1',[req.empresa_id]);const cfg={};r.rows.forEach(x=>cfg[x.chave]=x.valor);res.json(cfg);}catch(e){res.status(500).json({error:e.message});} });
 app.put('/api/config', auth, admin, async(req,res)=>{ try{for(const[k,v] of Object.entries(req.body)) await query('INSERT INTO config(chave,valor,empresa_id) VALUES($1,$2,$3) ON CONFLICT(chave,empresa_id) DO UPDATE SET valor=$2,atualizado_em=NOW()',[k,v,req.empresa_id]);res.json({ok:true});}catch(e){res.status(500).json({error:e.message});} });
@@ -85,3 +139,20 @@ app.get('/api/health', async(req,res)=>{ try{await query('SELECT 1');const e=awa
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log('PDV API SaaS rodando na porta ' + PORT));
+SRVEOF
+echo "[OK] API atualizada"
+
+# 3. Rebuild Docker
+echo "[3/3] Reconstruindo containers..."
+docker compose up -d --build
+
+sleep 5
+echo ""
+echo "Testando API..."
+curl -s http://localhost:3001/api/health
+echo ""
+echo ""
+echo "=========================================="
+echo "  MIGRAÇÃO CONCLUÍDA!"
+echo "  Empresa demo: senha 'admin123'"
+echo "=========================================="
